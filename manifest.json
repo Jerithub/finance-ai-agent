@@ -1,42 +1,20 @@
 {
-  "name": "Personal Finance AI",
+  "name": "Jerome's Personal Finance AI",
   "short_name": "FinanceAI",
   "description": "AI-powered personal expense tracker and budget manager",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#ffffff",
   "theme_color": "#3B82F6",
   "orientation": "portrait",
-  "scope": "/",
+  "scope": "./",
   "icons": [
     {
-      "src": "/vite.svg",
+      "src": "./vite.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any maskable"
     }
   ],
-  "screenshots": [
-    {
-      "src": "/vite.svg",
-      "sizes": "540x720",
-      "type": "image/svg+xml",
-      "form_factor": "narrow"
-    }
-  ],
-  "categories": ["finance", "productivity", "utilities"],
-  "shortcuts": [
-    {
-      "name": "Add Expense",
-      "short_name": "Add",
-      "description": "Quickly add a new expense",
-      "url": "/",
-      "icons": [
-        {
-          "src": "/vite.svg",
-          "sizes": "96x96"
-        }
-      ]
-    }
-  ]
+  "categories": ["finance", "productivity", "utilities"]
 }
