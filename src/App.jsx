@@ -10,6 +10,7 @@ const FinanceApp = () => {
   const [showAddForm, setShowAddForm] = useState(false);
   const [showAIChat, setShowAIChat] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('local'); // ← FIXED: Added missing state
   const [aiMessages, setAIMessages] = useState([]);
   const [aiInput, setAIInput] = useState('');
   const [newExpense, setNewExpense] = useState({
@@ -30,12 +31,148 @@ const FinanceApp = () => {
     'Other': '#98D8C8'
   };
 
-  // Sample data for demonstration
+  // Google Drive API credentials (optional for now)
+  const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+  const GOOGLE_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
+  const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest';
+  const SCOPES = 'https://www.googleapis.com/auth/drive.file';
+
+  // Add this to your App.jsx - Replace the Google API initialization section
+
+  // Modern Google Identity Services approach
   useEffect(() => {
+    loadFromLocalStorage();
+
+    // Register service worker for PWA
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        const swUrl = `${import.meta.env.BASE_URL}sw.js`;
+        navigator.serviceWorker.register(swUrl)
+          .then((registration) => {
+            console.log('SW registered: ', registration);
+          })
+          .catch((registrationError) => {
+            console.log('SW registration failed: ', registrationError);
+          });
+      });
+    }
+
+    // Initialize Google API (only if credentials are available)
+    if (GOOGLE_CLIENT_ID && GOOGLE_API_KEY) {
+      initializeModernGoogleAPI();
+    }
+  }, []);
+
+  const initializeModernGoogleAPI = async () => {
+    try {
+      // Load both the old gapi and new Google Identity Services
+      await Promise.all([
+        loadScript('https://apis.google.com/js/api.js'),
+        loadScript('https://accounts.google.com/gsi/client')
+      ]);
+
+      // Initialize the drive API part with gapi
+      await new Promise((resolve) => window.gapi.load('client', resolve));
+      
+      await window.gapi.client.init({
+        apiKey: GOOGLE_API_KEY,
+        discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'],
+      });
+
+      // Initialize Google Identity Services for auth
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleCredentialResponse,
+      });
+
+      console.log('Modern Google API initialized successfully');
+    } catch (error) {
+      console.error('Error initializing Google API:', error);
+      setSyncStatus('local');
+    }
+  };
+
+  const loadScript = (src) => {
+    return new Promise((resolve, reject) => {
+      if (document.querySelector(`script[src="${src}"]`)) {
+        resolve();
+        return;
+      }
+      
+      const script = document.createElement('script');
+      script.src = src;
+      script.onload = resolve;
+      script.onerror = reject;
+      document.body.appendChild(script);
+    });
+  };
+
+  const handleCredentialResponse = (response) => {
+    // Handle the JWT credential response
+    console.log('Credential response:', response);
+    setIsSignedIn(true);
+    setSyncStatus('synced');
+    // You would decode the JWT token here and set up the user session
+  };
+
+  // Updated sign-in method
+  const signInToGoogle = async () => {
+    try {
+      // Use Google Identity Services for a more modern approach
+      if (window.google && window.google.accounts) {
+        window.google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: 'https://www.googleapis.com/auth/drive.file',
+          callback: async (tokenResponse) => {
+            console.log('Token response:', tokenResponse);
+            
+            if (tokenResponse.access_token) {
+              // Set the access token for gapi client
+              window.gapi.client.setToken({
+                access_token: tokenResponse.access_token
+              });
+              
+              setIsSignedIn(true);
+              setSyncStatus('synced');
+              await loadFromGoogleDrive();
+            }
+          },
+        }).requestAccessToken();
+      } else {
+        // Fallback to old method
+        alert('Google API not properly loaded. Please refresh the page.');
+      }
+    } catch (error) {
+      console.error('Sign in failed:', error);
+      setSyncStatus('error');
+    }
+  };
+
+  // Updated sign-out method
+  const signOutFromGoogle = async () => {
+    try {
+      if (window.google && window.google.accounts) {
+        const token = window.gapi.client.getToken();
+        if (token) {
+          window.google.accounts.oauth2.revoke(token.access_token, () => {
+            console.log('Token revoked');
+          });
+          window.gapi.client.setToken(null);
+        }
+      }
+      setIsSignedIn(false);
+      setSyncStatus('local');
+    } catch (error) {
+      console.error('Sign out failed:', error);
+    }
+  };
+
+  const loadFromLocalStorage = () => {
     const savedExpenses = localStorage.getItem('financeAI_expenses');
     if (savedExpenses) {
       setExpenses(JSON.parse(savedExpenses));
     } else {
+      // Sample data for demo
       const sampleExpenses = [
         { id: 1, amount: 25.50, category: 'Food', description: 'Lunch at cafe', date: '2025-06-10' },
         { id: 2, amount: 15.00, category: 'Transportation', description: 'Uber ride', date: '2025-06-11' },
@@ -45,10 +182,97 @@ const FinanceApp = () => {
       setExpenses(sampleExpenses);
       localStorage.setItem('financeAI_expenses', JSON.stringify(sampleExpenses));
     }
-  }, []);
+    setSyncStatus('local');
+  };
 
-  const saveToLocalStorage = (expensesData) => {
-    localStorage.setItem('financeAI_expenses', JSON.stringify(expensesData));
+  const findOrCreateFinanceFile = async () => {
+    try {
+      // Search for existing file
+      const response = await window.gapi.client.drive.files.list({
+        q: "name='financeAI_expenses.json' and parents in 'appDataFolder'",
+        spaces: 'appDataFolder'
+      });
+
+      if (response.result.files.length > 0) {
+        return response.result.files[0].id;
+      }
+
+      // Create new file if doesn't exist
+      const fileMetadata = {
+        name: 'financeAI_expenses.json',
+        parents: ['appDataFolder']
+      };
+
+      const createResponse = await window.gapi.client.drive.files.create({
+        resource: fileMetadata
+      });
+
+      return createResponse.result.id;
+    } catch (error) {
+      console.error('Error finding/creating file:', error);
+      throw error;
+    }
+  };
+
+  const loadFromGoogleDrive = async () => {
+    if (!window.gapi || !isSignedIn) return;
+    
+    setIsLoading(true);
+    setSyncStatus('syncing');
+    
+    try {
+      const fileId = await findOrCreateFinanceFile();
+      
+      const response = await window.gapi.client.drive.files.get({
+        fileId: fileId,
+        alt: 'media'
+      });
+
+      if (response.body) {
+        const expensesData = JSON.parse(response.body);
+        setExpenses(expensesData);
+        saveToLocalStorage(expensesData);
+        setLastSync(new Date());
+        setSyncStatus('synced');
+      } else {
+        loadFromLocalStorage();
+      }
+    } catch (error) {
+      console.error('Failed to load from Google Drive:', error);
+      loadFromLocalStorage();
+      setSyncStatus('error');
+    }
+    
+    setIsLoading(false);
+  };
+
+  const saveToGoogleDrive = async (expensesData) => {
+    if (!window.gapi || !isSignedIn) {
+      saveToLocalStorage(expensesData);
+      return;
+    }
+
+    setSyncStatus('syncing');
+    
+    try {
+      const fileId = await findOrCreateFinanceFile();
+      
+      await window.gapi.client.request({
+        path: `https://www.googleapis.com/upload/drive/v3/files/${fileId}`,
+        method: 'PATCH',
+        params: { uploadType: 'media' },
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(expensesData, null, 2)
+      });
+
+      setLastSync(new Date());
+      setSyncStatus('synced');
+      saveToLocalStorage(expensesData);
+    } catch (error) {
+      console.error('Failed to save to Google Drive:', error);
+      setSyncStatus('error');
+      saveToLocalStorage(expensesData);
+    }
   };
 
   const addExpense = async () => {
@@ -60,7 +284,12 @@ const FinanceApp = () => {
       };
       const updatedExpenses = [expense, ...expenses];
       setExpenses(updatedExpenses);
-      saveToLocalStorage(updatedExpenses);
+      
+      if (isSignedIn) {
+        await saveToGoogleDrive(updatedExpenses);
+      } else {
+        saveToLocalStorage(updatedExpenses);
+      }
       
       setNewExpense({
         amount: '',
@@ -75,7 +304,12 @@ const FinanceApp = () => {
   const deleteExpense = async (id) => {
     const updatedExpenses = expenses.filter(exp => exp.id !== id);
     setExpenses(updatedExpenses);
-    saveToLocalStorage(updatedExpenses);
+    
+    if (isSignedIn) {
+      await saveToGoogleDrive(updatedExpenses);
+    } else {
+      saveToLocalStorage(updatedExpenses);
+    }
   };
 
   const exportData = () => {
@@ -88,7 +322,7 @@ const FinanceApp = () => {
     link.click();
   };
 
-  const importData = (event) => {
+  const importData = async (event) => {
     const file = event.target.files[0];
     if (file) {
       const reader = new FileReader();
@@ -104,7 +338,12 @@ const FinanceApp = () => {
             }
           }, []);
           setExpenses(mergedExpenses);
-          saveToLocalStorage(mergedExpenses);
+          
+          if (isSignedIn) {
+            await saveToGoogleDrive(mergedExpenses);
+          } else {
+            saveToLocalStorage(mergedExpenses);
+          }
         } catch (error) {
           alert('Invalid file format');
         }
@@ -143,11 +382,11 @@ RECENT TRANSACTIONS:
 ${expenses.slice(0, 5).map(exp => `- ${exp.date}: ${exp.description} - $${exp.amount} (${exp.category})`).join('\n')}
 
 Please provide personalized financial advice including:
-1. Budget recommendations
-2. Spending pattern analysis  
-3. Areas to reduce expenses
-4. Saving strategies
-5. Financial health assessment`;
+1. Budget recommendations based on the 50/30/20 rule
+2. Spending pattern analysis and trends
+3. Specific areas where I can reduce expenses
+4. Savings strategies tailored to my spending habits
+5. Financial health assessment and improvement suggestions`;
   };
 
   const handleSmartAdvice = (topic) => {
@@ -213,6 +452,19 @@ Try asking: "budget", "savings", or "trends"`;
     ]);
   };
 
+  const getSyncStatusDisplay = () => {
+    switch (syncStatus) {
+      case 'syncing':
+        return { icon: Cloud, text: 'Syncing...', color: 'text-blue-600' };
+      case 'synced':
+        return { icon: Cloud, text: 'Synced', color: 'text-green-600' };
+      case 'error':
+        return { icon: CloudOff, text: 'Sync Error', color: 'text-red-600' };
+      default:
+        return { icon: CloudOff, text: 'Local Only', color: 'text-gray-500' };
+    }
+  };
+
   // Calculate totals and analytics
   const totalExpenses = expenses.reduce((sum, exp) => sum + exp.amount, 0);
   const currentMonth = new Date().getMonth();
@@ -240,6 +492,8 @@ Try asking: "budget", "savings", or "trends"`;
     .sort((a, b) => new Date(a.date) - new Date(b.date))
     .slice(-7);
 
+  const StatusIcon = getSyncStatusDisplay().icon;
+
   return (
     <div className="min-h-screen bg-gray-50 p-4">
       <div className="max-w-6xl mx-auto">
@@ -248,22 +502,20 @@ Try asking: "budget", "savings", or "trends"`;
           <div className="flex justify-between items-start mb-4">
             <h1 className="text-3xl font-bold text-gray-800">Personal Finance AI</h1>
             <div className="flex items-center gap-2">
-              {isSignedIn ? (
-                <div className="flex items-center gap-2 text-green-600">
-                  <Cloud className="h-5 w-5" />
-                  <span className="text-sm">Synced</span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2 text-gray-500">
-                  <CloudOff className="h-5 w-5" />
-                  <span className="text-sm">Local</span>
-                </div>
-              )}
+              <div className={`flex items-center gap-2 ${getSyncStatusDisplay().color}`}>
+                <StatusIcon className="h-5 w-5" />
+                <span className="text-sm">{getSyncStatusDisplay().text}</span>
+              </div>
               <button
-                onClick={() => setShowSettings(true)}
-                className="p-2 text-gray-500 hover:text-gray-700"
+                onClick={() => {
+                  console.log('Settings button clicked! State:', showSettings);
+                  setShowSettings(true);
+                  console.log('setShowSettings(true) called');
+                }}
+                className="p-2 text-gray-500 hover:text-gray-700 bg-yellow-200 border border-yellow-400"
+                style={{ minWidth: '40px', minHeight: '40px' }}
               >
-                <Settings className="h-5 w-5" />
+                ⚙️
               </button>
             </div>
           </div>
@@ -273,6 +525,11 @@ Try asking: "budget", "savings", or "trends"`;
               Last synced: {lastSync.toLocaleString()}
             </p>
           )}
+          
+          {/* Debug Info */}
+          <div className="mb-4 text-sm text-gray-500 bg-gray-100 p-2 rounded">
+            Debug: Settings Modal: {showSettings ? 'OPEN' : 'CLOSED'} | Add Form: {showAddForm ? 'OPEN' : 'CLOSED'} | AI Chat: {showAIChat ? 'OPEN' : 'CLOSED'}
+          </div>
           
           {/* Summary Cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
@@ -310,30 +567,19 @@ Try asking: "budget", "savings", or "trends"`;
           {/* Action Buttons */}
           <div className="flex flex-wrap gap-3">
             <button
-              onClick={() => {
-                console.log('Add Expense clicked!'); 
-                setShowAddForm(true);
-              }}
+              onClick={() => setShowAddForm(true)}
               className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-blue-700 transition-colors"
             >
               <PlusCircle className="h-5 w-5" />
               Add Expense
             </button>
             <button
-              onClick={() => {
-                console.log('AI Assistant clicked!'); 
-                setShowAIChat(true);
-              }}
+              onClick={() => setShowAIChat(true)}
               className="bg-green-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-green-700 transition-colors"
             >
               <MessageCircle className="h-5 w-5" />
               AI Assistant
             </button>
-          </div>
-          
-          {/* Debug Info */}
-          <div className="mt-4 text-sm text-gray-500">
-            Debug: Add Form: {showAddForm ? 'OPEN' : 'CLOSED'} | AI Chat: {showAIChat ? 'OPEN' : 'CLOSED'}
           </div>
         </div>
 
@@ -404,78 +650,154 @@ Try asking: "budget", "savings", or "trends"`;
           </div>
         </div>
 
-        {/* Add Expense Modal */}
+        {/* Add Expense Modal - FIXED CONTRAST */}
         {showAddForm && (
           <div 
-            className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4"
-            style={{ 
-              position: 'fixed', 
-              top: 0, 
-              left: 0, 
-              right: 0, 
-              bottom: 0, 
-              zIndex: 9999,
-              backgroundColor: 'rgba(0, 0, 0, 0.8)'
+            className="fixed inset-0 flex items-center justify-center p-4"
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 10001,
+              backgroundColor: 'rgba(0, 0, 0, 0.7)'
             }}
           >
-            <div className="bg-white rounded-lg p-6 w-full max-w-md shadow-2xl">
-              <h3 className="text-lg font-semibold mb-4">Add New Expense</h3>
-              <div className="space-y-4">
+            <div 
+              className="rounded-xl shadow-2xl w-full max-w-lg mx-auto"
+              style={{
+                backgroundColor: '#ffffff',
+                maxWidth: '480px',
+                width: '95%',
+                maxHeight: '90vh',
+                overflow: 'auto'
+              }}
+            >
+              {/* Header */}
+              <div 
+                className="px-6 py-4 rounded-t-xl"
+                style={{ backgroundColor: '#3B82F6', color: '#ffffff' }}
+              >
+                <div className="flex justify-between items-center">
+                  <h3 className="text-xl font-bold" style={{ color: '#ffffff' }}>💰 Add New Expense</h3>
+                  <button
+                    onClick={() => setShowAddForm(false)}
+                    className="font-bold w-8 h-8 flex items-center justify-center rounded-full hover:bg-white hover:bg-opacity-20 transition-colors"
+                    style={{ color: '#ffffff', fontSize: '24px' }}
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+
+              {/* Content */}
+              <div className="p-6 space-y-5" style={{ backgroundColor: '#ffffff' }}>
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Amount</label>
+                  <label className="block text-sm font-semibold mb-2" style={{ color: '#374151' }}>
+                    💵 Amount
+                  </label>
                   <input
                     type="number"
                     step="0.01"
                     value={newExpense.amount}
                     onChange={(e) => setNewExpense({...newExpense, amount: e.target.value})}
-                    className="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors"
+                    style={{ 
+                      border: '2px solid #D1D5DB',
+                      backgroundColor: '#ffffff',
+                      color: '#111827'
+                    }}
                     placeholder="0.00"
+                    autoFocus
                   />
                 </div>
+
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Category</label>
+                  <label className="block text-sm font-semibold mb-2" style={{ color: '#374151' }}>
+                    🏷️ Category
+                  </label>
                   <select
                     value={newExpense.category}
                     onChange={(e) => setNewExpense({...newExpense, category: e.target.value})}
-                    className="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors"
+                    style={{ 
+                      border: '2px solid #D1D5DB',
+                      backgroundColor: '#ffffff',
+                      color: '#111827'
+                    }}
                   >
                     {categories.map(cat => (
-                      <option key={cat} value={cat}>{cat}</option>
+                      <option key={cat} value={cat} style={{ color: '#111827', backgroundColor: '#ffffff' }}>
+                        {cat}
+                      </option>
                     ))}
                   </select>
                 </div>
+
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                  <label className="block text-sm font-semibold mb-2" style={{ color: '#374151' }}>
+                    📝 Description
+                  </label>
                   <input
                     type="text"
                     value={newExpense.description}
                     onChange={(e) => setNewExpense({...newExpense, description: e.target.value})}
-                    className="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors"
+                    style={{ 
+                      border: '2px solid #D1D5DB',
+                      backgroundColor: '#ffffff',
+                      color: '#111827'
+                    }}
                     placeholder="What did you spend on?"
                   />
                 </div>
+
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+                  <label className="block text-sm font-semibold mb-2" style={{ color: '#374151' }}>
+                    📅 Date
+                  </label>
                   <input
                     type="date"
                     value={newExpense.date}
                     onChange={(e) => setNewExpense({...newExpense, date: e.target.value})}
-                    className="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors"
+                    style={{ 
+                      border: '2px solid #D1D5DB',
+                      backgroundColor: '#ffffff',
+                      color: '#111827'
+                    }}
                   />
                 </div>
+              </div>
+
+              {/* Footer */}
+              <div className="px-6 pb-6" style={{ backgroundColor: '#ffffff' }}>
                 <div className="flex gap-3">
                   <button
                     onClick={addExpense}
-                    className="flex-1 bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors"
+                    className="flex-1 py-3 px-4 rounded-lg font-semibold text-lg shadow-lg transition-all duration-200"
+                    style={{ 
+                      backgroundColor: '#3B82F6',
+                      color: '#ffffff'
+                    }}
+                    onMouseOver={(e) => e.target.style.backgroundColor = '#2563EB'}
+                    onMouseOut={(e) => e.target.style.backgroundColor = '#3B82F6'}
                     disabled={isLoading}
                   >
-                    {isLoading ? 'Saving...' : 'Add Expense'}
+                    {isLoading ? '⏳ Saving...' : '✅ Add Expense'}
                   </button>
                   <button
                     onClick={() => setShowAddForm(false)}
-                    className="flex-1 bg-gray-300 text-gray-700 py-2 rounded-md hover:bg-gray-400 transition-colors"
+                    className="flex-1 py-3 px-4 rounded-lg font-semibold text-lg transition-colors"
+                    style={{ 
+                      backgroundColor: '#F3F4F6',
+                      color: '#374151'
+                    }}
+                    onMouseOver={(e) => e.target.style.backgroundColor = '#E5E7EB'}
+                    onMouseOut={(e) => e.target.style.backgroundColor = '#F3F4F6'}
                   >
-                    Cancel
+                    ❌ Cancel
                   </button>
                 </div>
               </div>
@@ -483,147 +805,284 @@ Try asking: "budget", "savings", or "trends"`;
           </div>
         )}
 
-        {/* AI Chat Modal */}
+        {/* AI Chat Modal - FIXED CONTRAST */}
         {showAIChat && (
           <div 
-            className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4"
-            style={{ 
-              position: 'fixed', 
-              top: 0, 
-              left: 0, 
-              right: 0, 
-              bottom: 0, 
-              zIndex: 9999,
-              backgroundColor: 'rgba(0, 0, 0, 0.8)'
+            className="fixed inset-0 flex items-center justify-center p-4"
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 10002,
+              backgroundColor: 'rgba(0, 0, 0, 0.7)'
             }}
           >
-            <div className="bg-white rounded-lg p-6 w-full max-w-4xl h-5/6 flex flex-col shadow-2xl">
-              <div className="flex justify-between items-center mb-4 border-b pb-4">
-                <h3 className="text-xl font-bold text-gray-800">🤖 AI Financial Assistant</h3>
-                <button
-                  onClick={() => {
-                    console.log('Closing AI Chat');
-                    setShowAIChat(false);
-                  }}
-                  className="text-gray-500 hover:text-gray-700 text-2xl px-3 py-1 hover:bg-gray-100 rounded"
-                >
-                  ✕
-                </button>
+            <div 
+              className="rounded-xl shadow-2xl w-full h-full max-w-4xl flex flex-col"
+              style={{
+                backgroundColor: '#ffffff',
+                maxWidth: '900px',
+                width: '95%',
+                height: '85vh'
+              }}
+            >
+              {/* Header */}
+              <div 
+                className="px-6 py-4 rounded-t-xl"
+                style={{ backgroundColor: '#10B981', color: '#ffffff' }}
+              >
+                <div className="flex justify-between items-center">
+                  <h3 className="text-xl font-bold" style={{ color: '#ffffff' }}>🤖 AI Financial Assistant</h3>
+                  <button
+                    onClick={() => setShowAIChat(false)}
+                    className="font-bold w-8 h-8 flex items-center justify-center rounded-full hover:bg-white hover:bg-opacity-20 transition-colors"
+                    style={{ color: '#ffffff', fontSize: '24px' }}
+                  >
+                    ×
+                  </button>
+                </div>
               </div>
               
-              <div className="flex-1 overflow-y-auto mb-4 space-y-3 border rounded-lg p-4 bg-gray-50">
+              {/* Chat Area */}
+              <div className="flex-1 overflow-y-auto p-6" style={{ backgroundColor: '#F9FAFB' }}>
                 {aiMessages.length === 0 && (
-                  <div className="text-gray-600 text-center py-8">
-                    <h4 className="font-semibold mb-3 text-lg">💡 Smart Financial Assistant</h4>
-                    <p className="text-sm mb-6">Get instant advice or export for Claude Pro analysis</p>
-                    <div className="flex flex-wrap gap-3 justify-center">
+                  <div className="text-center py-12">
+                    <div className="text-6xl mb-4">🤖</div>
+                    <h4 className="text-xl font-bold mb-3" style={{ color: '#111827' }}>
+                      Smart Financial Assistant
+                    </h4>
+                    <p className="mb-8 text-lg" style={{ color: '#6B7280' }}>
+                      Get instant advice or export for Claude Pro analysis
+                    </p>
+                    <div className="flex flex-wrap gap-4 justify-center">
                       <button 
-                        onClick={() => {
-                          console.log('Budget tips clicked');
-                          handleSmartAdvice('budget');
-                        }}
-                        className="px-4 py-2 bg-blue-500 text-white rounded-lg text-sm hover:bg-blue-600 transition-colors shadow"
+                        onClick={() => handleSmartAdvice('budget')}
+                        className="px-6 py-3 rounded-xl text-base font-semibold shadow-lg transition-all duration-200"
+                        style={{ backgroundColor: '#3B82F6', color: '#ffffff' }}
+                        onMouseOver={(e) => e.target.style.backgroundColor = '#2563EB'}
+                        onMouseOut={(e) => e.target.style.backgroundColor = '#3B82F6'}
                       >
                         💰 Budget Tips
                       </button>
                       <button 
-                        onClick={() => {
-                          console.log('Savings tips clicked');
-                          handleSmartAdvice('savings');
-                        }}
-                        className="px-4 py-2 bg-green-500 text-white rounded-lg text-sm hover:bg-green-600 transition-colors shadow"
+                        onClick={() => handleSmartAdvice('savings')}
+                        className="px-6 py-3 rounded-xl text-base font-semibold shadow-lg transition-all duration-200"
+                        style={{ backgroundColor: '#10B981', color: '#ffffff' }}
+                        onMouseOver={(e) => e.target.style.backgroundColor = '#059669'}
+                        onMouseOut={(e) => e.target.style.backgroundColor = '#10B981'}
                       >
                         🏦 Save Money
                       </button>
                       <button 
-                        onClick={() => {
-                          console.log('Trends clicked');
-                          handleSmartAdvice('trends');
-                        }}
-                        className="px-4 py-2 bg-purple-500 text-white rounded-lg text-sm hover:bg-purple-600 transition-colors shadow"
+                        onClick={() => handleSmartAdvice('trends')}
+                        className="px-6 py-3 rounded-xl text-base font-semibold shadow-lg transition-all duration-200"
+                        style={{ backgroundColor: '#8B5CF6', color: '#ffffff' }}
+                        onMouseOver={(e) => e.target.style.backgroundColor = '#7C3AED'}
+                        onMouseOut={(e) => e.target.style.backgroundColor = '#8B5CF6'}
                       >
                         📊 Spending Trends
                       </button>
                     </div>
                   </div>
                 )}
-                {aiMessages.map((msg, idx) => (
-                  <div key={idx} className={`p-4 rounded-lg shadow-sm ${msg.type === 'user' ? 'bg-blue-100 ml-8 border-l-4 border-blue-500' : 'bg-white mr-8 border-l-4 border-green-500'}`}>
-                    <div className="text-sm font-semibold text-gray-700 mb-2">
-                      {msg.type === 'user' ? '👤 You' : '🤖 AI Assistant'}
+                
+                <div className="space-y-4">
+                  {aiMessages.map((msg, idx) => (
+                    <div key={idx} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div 
+                        className="max-w-xs lg:max-w-md px-4 py-3 rounded-2xl"
+                        style={msg.type === 'user' 
+                          ? { backgroundColor: '#3B82F6', color: '#ffffff' }
+                          : { backgroundColor: '#ffffff', color: '#111827', border: '1px solid #E5E7EB', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }
+                        }
+                      >
+                        <div className="text-xs font-semibold mb-1" style={{ opacity: 0.75 }}>
+                          {msg.type === 'user' ? '👤 You' : '🤖 AI Assistant'}
+                        </div>
+                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                      </div>
                     </div>
-                    <div className="whitespace-pre-wrap text-gray-800">{msg.content}</div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
               
-              <div className="space-y-3 border-t pt-4">
-                <button
-                  onClick={() => {
-                    const prompt = generateAIPrompt();
-                    navigator.clipboard.writeText(prompt);
-                    setAIMessages([...aiMessages, 
-                      { type: 'ai', content: '📋 Financial analysis prompt copied to clipboard! Paste this into Claude Pro for detailed insights.' }
-                    ]);
-                    console.log('Claude Pro prompt copied!');
-                  }}
-                  className="w-full bg-gradient-to-r from-purple-600 to-blue-600 text-white py-3 rounded-lg hover:from-purple-700 hover:to-blue-700 transition-colors font-semibold shadow-lg"
-                >
-                  📋 Copy Claude Pro Analysis Prompt
-                </button>
-                <div className="flex gap-3">
-                  <input
-                    type="text"
-                    value={aiInput}
-                    onChange={(e) => setAIInput(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && handleSmartAdvice(aiInput)}
-                    className="flex-1 border-2 border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    placeholder="Ask: budget, savings, or trends..."
-                  />
+              {/* Footer */}
+              <div className="border-t px-6 py-4 rounded-b-xl" style={{ backgroundColor: '#ffffff', borderColor: '#E5E7EB' }}>
+                <div className="space-y-3">
                   <button
                     onClick={() => {
-                      console.log('Ask button clicked with:', aiInput);
-                      handleSmartAdvice(aiInput); 
-                      setAIInput('');
+                      const prompt = generateAIPrompt();
+                      navigator.clipboard.writeText(prompt);
+                      setAIMessages([...aiMessages, 
+                        { type: 'ai', content: '📋 Financial analysis prompt copied to clipboard! Paste this into Claude Pro for detailed insights.' }
+                      ]);
                     }}
-                    className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition-colors font-semibold shadow"
+                    className="w-full py-3 rounded-lg font-semibold text-lg shadow-lg transition-all duration-200"
+                    style={{ backgroundColor: '#8B5CF6', color: '#ffffff' }}
+                    onMouseOver={(e) => e.target.style.backgroundColor = '#7C3AED'}
+                    onMouseOut={(e) => e.target.style.backgroundColor = '#8B5CF6'}
                   >
-                    Ask
+                    📋 Copy Claude Pro Analysis Prompt
                   </button>
+                  <div className="flex gap-3">
+                    <input
+                      type="text"
+                      value={aiInput}
+                      onChange={(e) => setAIInput(e.target.value)}
+                      onKeyPress={(e) => e.key === 'Enter' && handleSmartAdvice(aiInput)}
+                      className="flex-1 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      style={{ 
+                        border: '2px solid #D1D5DB',
+                        backgroundColor: '#ffffff',
+                        color: '#111827'
+                      }}
+                      placeholder="Ask about budget, savings, or trends..."
+                    />
+                    <button
+                      onClick={() => {handleSmartAdvice(aiInput); setAIInput('');}}
+                      className="px-6 py-2 rounded-lg font-semibold transition-colors"
+                      style={{ backgroundColor: '#3B82F6', color: '#ffffff' }}
+                      onMouseOver={(e) => e.target.style.backgroundColor = '#2563EB'}
+                      onMouseOut={(e) => e.target.style.backgroundColor = '#3B82F6'}
+                    >
+                      Ask 🚀
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
         )}
 
-        {/* Settings Modal */}
+        {/* Settings Modal - FIXED CONTRAST */}
         {showSettings && (
-          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-            <div className="bg-white rounded-lg p-6 w-full max-w-md">
-              <div className="flex justify-between items-center mb-4">
-                <h3 className="text-lg font-semibold">Settings & Data</h3>
-                <button
-                  onClick={() => setShowSettings(false)}
-                  className="text-gray-500 hover:text-gray-700"
-                >
-                  ✕
-                </button>
+          <div 
+            className="fixed inset-0 flex items-center justify-center p-4"
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 10000,
+              backgroundColor: 'rgba(0, 0, 0, 0.7)'
+            }}
+          >
+            <div 
+              className="rounded-xl shadow-2xl w-full max-w-lg mx-auto"
+              style={{
+                backgroundColor: '#ffffff',
+                maxWidth: '500px',
+                width: '95%',
+                maxHeight: '90vh',
+                overflow: 'auto'
+              }}
+            >
+              {/* Header */}
+              <div 
+                className="px-6 py-4 rounded-t-xl"
+                style={{ backgroundColor: '#6B7280', color: '#ffffff' }}
+              >
+                <div className="flex justify-between items-center">
+                  <h3 className="text-xl font-bold" style={{ color: '#ffffff' }}>⚙️ Settings & Data</h3>
+                  <button
+                    onClick={() => setShowSettings(false)}
+                    className="font-bold w-8 h-8 flex items-center justify-center rounded-full hover:bg-white hover:bg-opacity-20 transition-colors"
+                    style={{ color: '#ffffff', fontSize: '24px' }}
+                  >
+                    ×
+                  </button>
+                </div>
               </div>
               
-              <div className="space-y-4">
+              {/* Content */}
+              <div className="p-6 space-y-6" style={{ backgroundColor: '#ffffff' }}>
+                {/* Google Drive Connection */}
+                {GOOGLE_CLIENT_ID && GOOGLE_API_KEY ? (
+                  <div className="rounded-xl p-5" style={{ border: '2px solid #DBEAFE', backgroundColor: '#EFF6FF' }}>
+                    <h4 className="font-bold mb-3 text-lg" style={{ color: '#1E40AF' }}>☁️ Cloud Sync</h4>
+                    {isSignedIn ? (
+                      <div className="space-y-3">
+                        <div className="flex items-center gap-3" style={{ color: '#059669' }}>
+                          <Cloud className="h-5 w-5" />
+                          <span className="font-semibold">Connected to Google Drive</span>
+                        </div>
+                        <div 
+                          className="text-sm p-3 rounded-lg" 
+                          style={{ backgroundColor: '#ffffff', color: '#374151' }}
+                        >
+                          ✅ Data automatically syncs across all your devices
+                        </div>
+                        <button
+                          onClick={signOutFromGoogle}
+                          className="w-full py-3 rounded-lg font-semibold transition-colors"
+                          style={{ backgroundColor: '#F3F4F6', color: '#374151' }}
+                          onMouseOver={(e) => e.target.style.backgroundColor = '#E5E7EB'}
+                          onMouseOut={(e) => e.target.style.backgroundColor = '#F3F4F6'}
+                        >
+                          Disconnect
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="flex items-center gap-3" style={{ color: '#6B7280' }}>
+                          <CloudOff className="h-5 w-5" />
+                          <span>Using local storage only</span>
+                        </div>
+                        <button
+                          onClick={signInToGoogle}
+                          className="w-full py-3 rounded-lg font-semibold shadow-lg transition-all duration-200"
+                          style={{ backgroundColor: '#3B82F6', color: '#ffffff' }}
+                          onMouseOver={(e) => e.target.style.backgroundColor = '#2563EB'}
+                          onMouseOut={(e) => e.target.style.backgroundColor = '#3B82F6'}
+                        >
+                          Connect Google Drive
+                        </button>
+                        <p className="text-xs text-center" style={{ color: '#6B7280' }}>
+                          Sync your data across devices securely
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="rounded-xl p-5" style={{ border: '2px solid #FDE68A', backgroundColor: '#FFFBEB' }}>
+                    <h4 className="font-bold mb-3 text-lg" style={{ color: '#92400E' }}>☁️ Cloud Sync Setup</h4>
+                    <p className="text-sm mb-3" style={{ color: '#6B7280' }}>
+                      To enable Google Drive sync, add your credentials to the .env file:
+                    </p>
+                    <div 
+                      className="p-3 rounded-lg text-xs font-mono"
+                      style={{ backgroundColor: '#F3F4F6', color: '#374151' }}
+                    >
+                      VITE_GOOGLE_CLIENT_ID=your-client-id<br/>
+                      VITE_GOOGLE_API_KEY=your-api-key
+                    </div>
+                  </div>
+                )}
+
                 {/* Data Management */}
-                <div className="border rounded-lg p-4">
-                  <h4 className="font-medium mb-2">Data Management</h4>
-                  <div className="space-y-2">
+                <div className="rounded-xl p-5" style={{ border: '2px solid #D1FAE5', backgroundColor: '#ECFDF5' }}>
+                  <h4 className="font-bold mb-3 text-lg" style={{ color: '#047857' }}>💾 Data Management</h4>
+                  <div className="space-y-3">
                     <button
                       onClick={exportData}
-                      className="w-full bg-green-600 text-white py-2 rounded-md hover:bg-green-700 transition-colors flex items-center justify-center gap-2"
+                      className="w-full py-3 rounded-lg font-semibold shadow-lg transition-all duration-200 flex items-center justify-center gap-2"
+                      style={{ backgroundColor: '#10B981', color: '#ffffff' }}
+                      onMouseOver={(e) => e.target.style.backgroundColor = '#059669'}
+                      onMouseOut={(e) => e.target.style.backgroundColor = '#10B981'}
                     >
-                      <Download className="h-4 w-4" />
+                      <Download className="h-5 w-5" />
                       Export Data
                     </button>
-                    <label className="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors flex items-center justify-center gap-2 cursor-pointer">
-                      <Upload className="h-4 w-4" />
+                    <label 
+                      className="w-full py-3 rounded-lg font-semibold cursor-pointer shadow-lg transition-all duration-200 flex items-center justify-center gap-2"
+                      style={{ backgroundColor: '#3B82F6', color: '#ffffff' }}
+                      onMouseOver={(e) => e.target.style.backgroundColor = '#2563EB'}
+                      onMouseOut={(e) => e.target.style.backgroundColor = '#3B82F6'}
+                    >
+                      <Upload className="h-5 w-5" />
                       Import Data
                       <input
                         type="file"
@@ -636,19 +1095,40 @@ Try asking: "budget", "savings", or "trends"`;
                 </div>
 
                 {/* App Info */}
-                <div className="border rounded-lg p-4">
-                  <h4 className="font-medium mb-2">App Info</h4>
-                  <div className="text-sm text-gray-600 space-y-1">
-                    <p>• Free personal finance tracker</p>
-                    <p>• Data stored locally with export/import</p>
-                    <p>• Export data for AI analysis with Claude Pro</p>
-                    <p>• Works offline - no internet required</p>
+                <div className="rounded-xl p-5" style={{ border: '2px solid #E9D5FF', backgroundColor: '#FAF5FF' }}>
+                  <h4 className="font-bold mb-3 text-lg" style={{ color: '#7C2D12' }}>ℹ️ App Info</h4>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: '#10B981' }}>•</span>
+                      <span style={{ color: '#374151' }}>Free personal finance tracker</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: '#10B981' }}>•</span>
+                      <span style={{ color: '#374151' }}>
+                        {isSignedIn ? 'Data synced with Google Drive' : 'Data stored locally'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: '#10B981' }}>•</span>
+                      <span style={{ color: '#374151' }}>Export data for AI analysis with Claude Pro</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: '#10B981' }}>•</span>
+                      <span style={{ color: '#374151' }}>Works offline with automatic sync</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: '#10B981' }}>•</span>
+                      <span className="font-semibold" style={{ color: '#111827' }}>
+                        {expenses.length} transactions tracked
+                      </span>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
         )}
+
       </div>
     </div>
   );
